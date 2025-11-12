@@ -1,0 +1,5 @@
+body{ font-family: Arial, sans-serif; margin:20px; }
+.container{ max-width:900px; margin:0 auto; }
+.service{ border:1px solid #ddd; padding:10px; margin:8px 0; }
+.service ul{ margin:6px 0 0 16px; }
+.eng{ border-bottom:1px dashed #ccc; padding:6px 0; }
