@@ -1,5 +1,5 @@
 async function leadServices(){
-    const res = await fetch('/api/lead-services');
+    const res = await fetch('/api/services');
     const services = await res.json();
     const div = document.getElementById('services');
     div.innerHTML = '';

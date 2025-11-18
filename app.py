@@ -20,8 +20,7 @@ def home():
 
 @app.route("/api/services")
 def get_services():
-    services_collection = db['services']
-    services = list(services_collection.find({}, {'_id': 0}))
+    services = list(db.services.find({}, {"_id":0}))
     return jsonify(services)
 
 if __name__ == '__main__':
