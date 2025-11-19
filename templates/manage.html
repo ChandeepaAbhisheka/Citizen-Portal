@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Manage Services</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<h2>Manage Services</h2>
+
+<div>
+    <h3>Add / Update Service</h3>
+    <input type="text" id="service_id" placeholder="Service ID">
+    <input type="text" id="service_name" placeholder="Service Name">
+    <input type="text" id="service_questions" placeholder="Questions (comma-separated)">
+    <button onclick="saveService()">Save</button>
+</div>
+
+<hr>
+
+<h3>Existing Services</h3>
+<table border="1" cellpadding="8">
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Questions</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody id="services_table"></tbody>
+</table>
+
+<script src="/static/manage.js"></script>
+</body>
+</html>
