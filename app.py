@@ -194,7 +194,31 @@ def admin_insights():
         "desires": desires, 
         "premium_suggestions": premium_suggestions 
     }) 
- 
+
+# Admin CRUD for services (create/update/delete)
+@app.route("/api/admin/services", methods=["GET", "POST"])
+@admin_required
+def admin_services():
+    if request.method == "GET":
+        # Return all services
+        services = list(services_col.find({}, {"_id": 0}))
+        return jsonify(services)
+
+    # POST → create or update
+    payload = request.json or {}
+    sid = payload.get("id")
+
+    if not sid:
+        return jsonify({"error": "Service ID is required"}), 400
+
+    services_col.update_one(
+        {"id": sid},
+        {"$set": payload},
+        upsert=True
+    )
+
+    return jsonify({"status": "ok"})
+
 @app.route("/api/admin/engagements") 
 @admin_required 
 def admin_engagements(): 
@@ -227,21 +251,7 @@ def export_csv():
         download_name="engagements.csv" 
     ) 
  
-# Admin CRUD for services (create/update/delete) 
-@app.route("/api/admin/services", methods=["GET","POST"]) 
-@admin_required 
-def admin_services(): 
-    if request.method == "GET": 
-        return jsonify(list(services_col.find({}, {"_id":0}))) 
- 
-    payload = request.json or {} 
-    # create new service doc or update if id exists 
-    sid = payload.get("id") 
-    if not sid: 
-        return jsonify({"error":"id required"}), 400 
-    services_col.update_one({"id": sid}, {"$set": payload}, upsert=True) 
-    return jsonify({"status":"ok"}) 
- 
+
 @app.route("/api/admin/services/<service_id>", methods=["DELETE"]) 
 @admin_required 
 def delete_service(service_id): 
