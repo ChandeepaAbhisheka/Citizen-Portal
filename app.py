@@ -33,16 +33,32 @@
 import os 
 from flask import Flask, jsonify, render_template, request, session, redirect, send_file 
 from flask_cors import CORS 
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from pymongo import MongoClient 
+from typing import cast, List, Dict, Any
+from pymongo.cursor import Cursor
 from bson import ObjectId 
 from datetime import datetime 
 from io import StringIO, BytesIO 
 import csv 
 from dotenv import load_dotenv 
+
+# Import our Gemini RAG system
+from ai.gemini_rag import GeminiRAGSystem
+
 load_dotenv() 
 app = Flask(__name__, static_folder="static", template_folder="templates") 
 app.secret_key = os.getenv("FLASK_SECRET", "dev-secret") 
 CORS(app) 
+
+# Rate limiting
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
+
 # MongoDB connection (replace with your Atlas URI) 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/") 
 client = MongoClient(MONGO_URI) 
@@ -50,6 +66,12 @@ db = client["citizen_portal"]
 services_col = db["services"] 
 eng_col = db["engagements"] 
 admins_col = db["admins"] 
+
+# Initialize Gemini RAG System
+print("🚀 Initializing AI System...")
+rag_system = GeminiRAGSystem()
+print("✓ AI System ready!")
+
 # --- Helpers --- 
 def admin_required(fn): 
     from functools import wraps 
@@ -257,13 +279,256 @@ def export_csv():
 def delete_service(service_id): 
     services_col.delete_one({"id": service_id}) 
     return jsonify({"status":"deleted"}) 
+
+@app.route('/api/admin/index-documents', methods=['POST'])
+def index_documents():
+    """
+    Admin endpoint to add documents to knowledge base
+    
+    Request body:
+    {
+        "documents": [
+            {
+                "text": "Document content here",
+                "source": "https://example.com",
+                "title": "Document Title"
+            }
+        ]
+    }
+    """
+    try:
+        # TODO: Add admin authentication
+        
+        data = request.get_json()
+        documents = data.get('documents', [])
+        
+        if not documents:
+            return jsonify({"error": "No documents provided"}), 400
+        
+        # Add to RAG system
+        count = rag_system.add_documents(documents)
+        
+        return jsonify({
+            "message": f"Successfully indexed {count} documents",
+            "count": count
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/admin/search-analytics', methods=['GET'])
+def search_analytics():
+    """Get search analytics for admin"""
+    try:
+        # Get all searches
+        searches = list(db.ai_searches.find({}).sort('timestamp', -1).limit(100))
+        
+        # Calculate metrics
+        total = len(searches)
+        high_confidence = sum(1 for s in searches if s.get('confidence') == 'high')
+        
+        return jsonify({
+            "total_searches": total,
+            "high_confidence_rate": (high_confidence / total * 100) if total > 0 else 0,
+            "recent_searches": searches[:20]
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # --- Placeholders for AI integration (vector DB, embeddings) 
 
-@app.route("/api/ai/search", methods=["POST"]) 
-def ai_search(): 
-    # Placeholder: in future, accept textual query, get embeddings, search
-    # a vector DB (FAISS/Pinecone), and return relevant docs + generated answer via LLM.
-    return jsonify({"message":"AI search not configured. Add vector DB + LLM."}) 
+# @app.route("/api/ai/search", methods=["POST"]) 
+# def ai_search(): 
+#     # Placeholder: in future, accept textual query, get embeddings, search
+#     # a vector DB (FAISS/Pinecone), and return relevant docs + generated answer via LLM.
+#     return jsonify({"message":"AI search not configured. Add vector DB + LLM."}) 
+
+
+
+# ============================================
+# AI ENDPOINTS
+# ============================================
+
+@app.route('/api/ai/search', methods=['POST'])
+@limiter.limit("20 per minute")
+def ai_search():
+    """
+    AI-powered search endpoint using Gemini
+    
+    Request body:
+    {
+        "query": "How do I apply for a passport?"
+    }
+    """
+    try:
+        data = request.get_json()
+        query = data.get('query', '').strip()
+        
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+        
+        if len(query) < 3:
+            return jsonify({"error": "Query too short"}), 400
+        
+        # Get answer from Gemini RAG
+        result = rag_system.answer_query(query, n_results=5)
+        
+        # Log the search
+        db.ai_searches.insert_one({
+            'query': query,
+            'timestamp': datetime.utcnow(),
+            'confidence': result['confidence'],
+            'sources_count': result['retrieved_docs'],
+            'ip_address': request.remote_addr
+        })
+        
+        return jsonify(result)
+    
+    except Exception as e:
+        app.logger.error(f"AI search error: {str(e)}")
+        return jsonify({
+            "error": "Search failed",
+            "message": "Please try again or contact support"
+        }), 500
+
+@app.route('/api/ai/chat', methods=['POST'])
+@limiter.limit("30 per minute")
+def ai_chat():
+    """
+    Interactive chat with Gemini
+    
+    Request body:
+    {
+        "message": "Hello!",
+        "history": [{"role": "user", "content": "Hi"}]  # optional
+    }
+    """
+    try:
+        data = request.get_json()
+        message = data.get('message', '').strip()
+        history = data.get('history', [])
+        
+        if not message:
+            return jsonify({"error": "Message is required"}), 400
+        
+        result = rag_system.chat(message, history)
+        
+        return jsonify({
+            "response": result['response'],
+            "history": result['history']
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/ai/stats', methods=['GET'])
+def ai_stats():
+    """Get AI system statistics"""
+    try:
+        stats = rag_system.get_stats()
+        
+        # Add search statistics
+        total_searches = db.ai_searches.count_documents({})
+        recent_searches = list(db.ai_searches.find({}).sort('timestamp', -1).limit(10))
+        
+        return jsonify({
+            **stats,
+            'total_searches': total_searches,
+            'recent_queries': [s['query'] for s in recent_searches]
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+# ============================================
+# HEALTH CHECK
+# ============================================
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "ai_system": "operational",
+        "database": "connected",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+@app.route('/api/webhook/n8n/scrape', methods=['POST'])
+def n8n_scrape_webhook():
+    """
+    Webhook for N8N to trigger document scraping
+    
+    Request body:
+    {
+        "urls": [
+            {"url": "https://example.com", "type": "html", "title": "Page Title"}
+        ]
+    }
+    """
+    try:
+        data = request.get_json()
+        urls = data.get('urls', [])
+        
+        if not urls:
+            return jsonify({"error": "No URLs provided"}), 400
+        
+        # Import scraper
+        from scripts.document_scrapper import DocumentScraper
+        scraper = DocumentScraper()
+        
+        # Scrape and index
+        count = scraper.scrape_and_index(urls)
+        
+        return jsonify({
+            "success": True,
+            "count": count,
+            "message": f"Successfully scraped and indexed {count} documents"
+        })
+    
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+@app.route('/api/webhook/n8n/query', methods=['POST'])
+def n8n_query_webhook():
+    """
+    Webhook for N8N to query the AI system
+    
+    Request body:
+    {
+        "query": "How do I apply for a passport?",
+        "user_id": "telegram_12345"
+    }
+    """
+    try:
+        data = request.get_json()
+        query = data.get('query', '')
+        user_id = data.get('user_id', 'anonymous')
+        
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+        
+        # Get answer
+        result = rag_system.answer_query(query)
+        
+        # Log engagement
+        db.engagements.insert_one({
+            'user_id': user_id,
+            'query': query,
+            'timestamp': datetime.utcnow(),
+            'source': 'n8n_webhook',
+            'confidence': result['confidence']
+        })
+        
+        return jsonify(result)
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
 if __name__ == "__main__": 
     # ensure at least one admin user exists (dev convenience) 
     if admins_col.count_documents({}) == 0: 
