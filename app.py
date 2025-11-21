@@ -81,6 +81,25 @@ def admin_required(fn):
             return jsonify({"error":"unauthorized"}), 401 
         return fn(*a, **kw) 
     return wrapper 
+
+
+knowledge_base = [
+    {
+        "text": "To apply for a passport in Sri Lanka, you need: Birth certificate, National ID card, and two passport photos. Visit the Department of Immigration.",
+        "source": "https://immigration.gov.lk",
+        "title": "Passport Application"
+    },
+    {
+        "text": "Tax filing deadline in Sri Lanka is November 30 for individuals. You can file online at ird.gov.lk",
+        "source": "https://ird.gov.lk",
+        "title": "Tax Filing"
+    },
+    {
+        "text": "To get a National ID card, visit your Divisional Secretariat with birth certificate and proof of residence.",
+        "source": "https://deptregistration.gov.lk",
+        "title": "NIC Application"
+    }
+]
         
 # --- Public routes --- 
 @app.route("/") 
@@ -99,27 +118,38 @@ def get_service(service_id):
 
 @app.route("/api/engagement", methods=["POST"]) 
 def log_engagement(): 
-    payload = request.json or {} 
-    # safely parse age: avoid passing None/invalid values to int()
-    age_val = payload.get("age") 
-    age = None 
-    if age_val is not None and age_val != "": 
-        try: 
-            age = int(age_val) 
-        except (ValueError, TypeError): 
-            age = None 
+    """Log user engagement to MongoDB"""
+    try:
+        payload = request.json or {} 
+        
+        # safely parse age: avoid passing None/invalid values to int()
+        age_val = payload.get("age") 
+        age = None 
+        if age_val is not None and age_val != "": 
+            try: 
+                age = int(age_val) 
+            except (ValueError, TypeError): 
+                age = None 
 
-    doc = { 
-        "user_id": payload.get("user_id") or None, 
-        "age": age, 
-        "job": payload.get("job"), 
-        "desires": payload.get("desires") or [], 
-        "question_clicked": payload.get("question_clicked"), 
-        "service": payload.get("service"), 
-        "timestamp": datetime.utcnow() 
-    } 
-    eng_col.insert_one(doc) 
-    return jsonify({"status":"ok"}) 
+        doc = { 
+            "user_id": payload.get("user_id") or None, 
+            "age": age, 
+            "job": payload.get("job"), 
+            "desires": payload.get("desires") or [], 
+            "question_clicked": payload.get("question_clicked"), 
+            "service": payload.get("service"),
+            "source": payload.get("source", "web"),  # NEW: track source (web, telegram, etc.)
+            "timestamp": datetime.utcnow() 
+        } 
+        
+        eng_col.insert_one(doc)
+        print(f"📝 Engagement logged: {doc}")  # NEW: helpful for debugging
+        
+        return jsonify({"status": "ok", "success": True}) 
+    
+    except Exception as e:
+        print(f"❌ Engagement error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 # --- Admin site --- 
 @app.route("/admin") 
@@ -336,61 +366,98 @@ def search_analytics():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- Placeholders for AI integration (vector DB, embeddings) 
-
-# @app.route("/api/ai/search", methods=["POST"]) 
-# def ai_search(): 
-#     # Placeholder: in future, accept textual query, get embeddings, search
-#     # a vector DB (FAISS/Pinecone), and return relevant docs + generated answer via LLM.
-#     return jsonify({"message":"AI search not configured. Add vector DB + LLM."}) 
-
-
-
+@app.route('/api/admin/analytics', methods=['GET'])
+def get_analytics():
+    """Get analytics for admin dashboard"""
+    try:
+        # Calculate statistics
+        total_searches = len(search_logs)
+        total_engagements = len(engagement_logs)
+        
+        # Count high confidence searches
+        high_confidence = sum(1 for s in search_logs if s.get('confidence') == 'high')
+        high_confidence_rate = (high_confidence / total_searches * 100) if total_searches > 0 else 0
+        
+        # Get recent searches
+        recent_searches = search_logs[-10:] if search_logs else []
+        
+        # Get top queries (simple count)
+        query_counts = {}
+        for s in search_logs:
+            q = s.get('query', '')
+            query_counts[q] = query_counts.get(q, 0) + 1
+        
+        top_queries = sorted(query_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        return jsonify({
+            "total_searches": total_searches,
+            "total_engagements": total_engagements,
+            "high_confidence_rate": round(high_confidence_rate, 1),
+            "recent_searches": recent_searches,
+            "top_queries": [{"query": q, "count": c} for q, c in top_queries],
+            "knowledge_base_size": len(knowledge_base),
+            "generated_at": datetime.now().isoformat()
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
 # ============================================
 # AI ENDPOINTS
 # ============================================
 
+# Store for tracking (simple in-memory for now)
+search_logs = []
+engagement_logs = []
+
 @app.route('/api/ai/search', methods=['POST'])
-@limiter.limit("20 per minute")
 def ai_search():
-    """
-    AI-powered search endpoint using Gemini
-    
-    Request body:
-    {
-        "query": "How do I apply for a passport?"
-    }
-    """
+    """AI search endpoint with logging"""
     try:
         data = request.get_json()
-        query = data.get('query', '').strip()
+        
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+        
+        query = data.get('query', '').strip().lower()
         
         if not query:
             return jsonify({"error": "Query is required"}), 400
         
-        if len(query) < 3:
-            return jsonify({"error": "Query too short"}), 400
+        # Simple keyword search
+        results = []
+        for doc in knowledge_base:
+            if any(word in doc['text'].lower() for word in query.split()):
+                results.append(doc)
         
-        # Get answer from Gemini RAG
-        result = rag_system.answer_query(query, n_results=5)
+        # Generate answer
+        if results:
+            answer = results[0]['text']
+            sources = [{"title": r['title'], "url": r['source']} for r in results]
+            confidence = "high"
+        else:
+            answer = f"I don't have specific information about '{query}'."
+            sources = []
+            confidence = "low"
         
-        # Log the search
-        db.ai_searches.insert_one({
-            'query': query,
-            'timestamp': datetime.utcnow(),
-            'confidence': result['confidence'],
-            'sources_count': result['retrieved_docs'],
-            'ip_address': request.remote_addr
+        # LOG THE SEARCH (for analytics)
+        search_logs.append({
+            "query": query,
+            "confidence": confidence,
+            "timestamp": datetime.now().isoformat(),
+            "sources_count": len(sources)
         })
         
-        return jsonify(result)
+        return jsonify({
+            "query": query,
+            "answer": answer,
+            "sources": sources,
+            "confidence": confidence
+        })
     
     except Exception as e:
-        app.logger.error(f"AI search error: {str(e)}")
-        return jsonify({
-            "error": "Search failed",
-            "message": "Please try again or contact support"
-        }), 500
+        return jsonify({"error": "Search failed", "message": str(e)}), 500
+
 
 @app.route('/api/ai/chat', methods=['POST'])
 @limiter.limit("30 per minute")
