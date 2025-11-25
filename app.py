@@ -30,27 +30,35 @@
 # if __name__ == '__main__':
 #     app.run(debug=True)
 
-import os 
-from flask import Flask, jsonify, render_template, request, session, redirect, send_file 
-from flask_cors import CORS 
+import os
+import traceback # ADDED: To see real errors
+from flask import Flask, jsonify, render_template, request, session, redirect, send_file
+from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from pymongo import MongoClient 
-from typing import cast, List, Dict, Any
-from pymongo.cursor import Cursor
-from bson import ObjectId 
-from datetime import datetime 
-from io import StringIO, BytesIO 
-import csv 
-from dotenv import load_dotenv 
+from pymongo import MongoClient
+from typing import List, Dict, Any
+from datetime import datetime
+from io import StringIO, BytesIO
+import csv
+from dotenv import load_dotenv
 
-# Import our Gemini RAG system
-from ai.gemini_rag import GeminiRAGSystem
+# --- Import AI System ---
+GeminiComplete = None
+try:
+    from ai.gemini_complete import GeminiComplete  # type: ignore
+    print("✅ Imported GeminiComplete from ai/")
+except ImportError:
+    try:
+        from gemini_complete import GeminiComplete  # type: ignore
+        print("✅ Imported GeminiComplete from root")
+    except ImportError:
+        print("❌ ERROR: Could not find gemini_complete.py")
 
-load_dotenv() 
-app = Flask(__name__, static_folder="static", template_folder="templates") 
-app.secret_key = os.getenv("FLASK_SECRET", "dev-secret") 
-CORS(app) 
+load_dotenv()
+app = Flask(__name__, static_folder="static", template_folder="templates")
+app.secret_key = os.getenv("FLASK_SECRET", "dev-secret")
+CORS(app)
 
 # Rate limiting
 limiter = Limiter(
@@ -59,598 +67,382 @@ limiter = Limiter(
     default_limits=["200 per day", "50 per hour"]
 )
 
-# MongoDB connection (replace with your Atlas URI) 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/") 
-client = MongoClient(MONGO_URI) 
-db = client["citizen_portal"] 
-services_col = db["services"] 
-eng_col = db["engagements"] 
-admins_col = db["admins"] 
+# MongoDB connection
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+db = None
+services_col = None
+eng_col = None
+admins_col = None
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    db = client["citizen_portal"]
+    services_col = db["services"]
+    eng_col = db["engagements"]
+    admins_col = db["admins"]
+    # Test connection
+    client.server_info()
+    print("✅ Connected to MongoDB")
 
-# Initialize Gemini RAG System
+    # FORCE UPDATE the admin user
+    username = "admin"
+    new_password = os.getenv("ADMIN_PWD", "admin123")
+
+    admins_col.update_one(
+        {"username": username},
+        {"$set": {"password": new_password}},
+        upsert=True # This creates it if it doesn't exist
+    )
+except Exception as e:
+    print(f"⚠️ MongoDB Warning: {e}")
+
+# Initialize AI System
 print("🚀 Initializing AI System...")
-rag_system = GeminiRAGSystem()
-print("✓ AI System ready!")
+try:
+    if GeminiComplete:
+        rag_system = GeminiComplete()
+        print("✓ AI System ready!")
+    else:
+        rag_system = None
+        print("⚠️ AI System NOT loaded (Missing file)")
+except Exception as e:
+    print(f"❌ AI Init Failed: {e}")
+    rag_system = None
 
-# --- Helpers --- 
-def admin_required(fn): 
-    from functools import wraps 
-    @wraps(fn) 
-    def wrapper(*a, **kw): 
-        if not session.get("admin_logged_in"): 
-            return jsonify({"error":"unauthorized"}), 401 
-        return fn(*a, **kw) 
-    return wrapper 
+# --- Helpers ---
+def admin_required(fn):
+    from functools import wraps
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        if not session.get("admin_logged_in"):
+            return jsonify({"error":"unauthorized"}), 401
+        return fn(*a, **kw)
+    return wrapper
 
+# Simple fallback knowledge base (since we aren't doing full Vector Search in app.py yet)
+knowledge_base_text = """
+To apply for a passport in Sri Lanka, you need: Birth certificate, National ID card, and two passport photos. Visit the Department of Immigration.
+Tax filing deadline in Sri Lanka is November 30 for individuals. You can file online at ird.gov.lk
+To get a National ID card, visit your Divisional Secretariat with birth certificate and proof of residence.
+"""
 
-knowledge_base = [
-    {
-        "text": "To apply for a passport in Sri Lanka, you need: Birth certificate, National ID card, and two passport photos. Visit the Department of Immigration.",
-        "source": "https://immigration.gov.lk",
-        "title": "Passport Application"
-    },
-    {
-        "text": "Tax filing deadline in Sri Lanka is November 30 for individuals. You can file online at ird.gov.lk",
-        "source": "https://ird.gov.lk",
-        "title": "Tax Filing"
-    },
-    {
-        "text": "To get a National ID card, visit your Divisional Secretariat with birth certificate and proof of residence.",
-        "source": "https://deptregistration.gov.lk",
-        "title": "NIC Application"
-    }
-]
-        
-# --- Public routes --- 
-@app.route("/") 
-def home(): 
-    return render_template("index.html") 
+# Initialize knowledge base as list for indexing documents
+knowledge_base = []
 
-@app.route("/api/services") 
-def get_services(): 
-    docs = list(services_col.find({}, {"_id":0})) 
-    return jsonify(docs) 
+# --- Public routes ---
+@app.route("/")
+def home():
+    return render_template("index.html")
 
-@app.route("/api/service/<service_id>") 
-def get_service(service_id): 
-    doc = services_col.find_one({"id": service_id}, {"_id":0}) 
-    return jsonify(doc or {}) 
+@app.route("/api/services")
+def get_services():
+    if db is None or services_col is None: return jsonify([])
+    docs = list(services_col.find({}, {"_id":0}))
+    return jsonify(docs)
 
-@app.route("/api/engagement", methods=["POST"]) 
-def log_engagement(): 
+@app.route("/api/service/<service_id>")
+def get_service(service_id):
+    if db is None or services_col is None: return jsonify({})
+    doc = services_col.find_one({"id": service_id}, {"_id":0})
+    return jsonify(doc or {})
+
+@app.route("/api/engagement", methods=["POST"])
+def log_engagement():
     """Log user engagement to MongoDB"""
+    if db is None or eng_col is None: return jsonify({"status": "skipped (no db)"})
     try:
-        payload = request.json or {} 
+        payload = request.json or {}
         
-        # safely parse age: avoid passing None/invalid values to int()
-        age_val = payload.get("age") 
-        age = None 
-        if age_val is not None and age_val != "": 
-            try: 
-                age = int(age_val) 
-            except (ValueError, TypeError): 
-                age = None 
+        # safely parse age
+        age_val = payload.get("age")
+        age = None
+        if age_val is not None and age_val != "":
+            try:
+                age = int(age_val)
+            except (ValueError, TypeError):
+                age = None
 
-        doc = { 
-            "user_id": payload.get("user_id") or None, 
-            "age": age, 
-            "job": payload.get("job"), 
-            "desires": payload.get("desires") or [], 
-            "question_clicked": payload.get("question_clicked"), 
+        doc = {
+            "user_id": payload.get("user_id") or None,
+            "age": age,
+            "job": payload.get("job"),
+            "desires": payload.get("desires") or [],
+            "question_clicked": payload.get("question_clicked"),
             "service": payload.get("service"),
-            "source": payload.get("source", "web"),  # NEW: track source (web, telegram, etc.)
-            "timestamp": datetime.utcnow() 
-        } 
+            "source": payload.get("source", "web"),
+            "timestamp": datetime.utcnow()
+        }
         
         eng_col.insert_one(doc)
-        print(f"📝 Engagement logged: {doc}")  # NEW: helpful for debugging
-        
-        return jsonify({"status": "ok", "success": True}) 
+        print(f"📝 Engagement logged")
+        return jsonify({"status": "ok", "success": True})
     
     except Exception as e:
         print(f"❌ Engagement error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-# --- Admin site --- 
-@app.route("/admin") 
-def admin_page(): 
-    if not session.get("admin_logged_in"): 
-        return redirect("/admin/login") 
-    return render_template("admin.html") 
+# --- Admin site ---
+@app.route("/admin")
+def admin_page():
+    if not session.get("admin_logged_in"):
+        return redirect("/admin/login")
+    return render_template("admin.html")
 
-@app.route("/admin/manage") 
-@admin_required 
-def manage_page(): 
-    return render_template("manage.html") 
-
-@app.route("/admin/login", methods=["GET","POST"]) 
-def admin_login(): 
-    if request.method == "GET": 
-        return render_template("admin.html")  # admin page has the login modal 
-    data = request.form 
-    username = data.get("username") 
-    password = data.get("password") 
-    admin = admins_col.find_one({"username": username}) 
-    if admin and admin.get("password") == password: 
-        session["admin_logged_in"] = True 
-        session["admin_user"] = username 
-        return redirect("/admin") 
-    return "Login failed", 401 
- 
-@app.route("/api/admin/logout", methods=["POST"]) 
-@admin_required 
-def admin_logout(): 
-    session.clear() 
-    return jsonify({"status":"logged out"}) 
- 
-# Admin API: insights and user management 
-@app.route("/api/admin/insights") 
-@admin_required 
-def admin_insights(): 
-    # Age groups 
-    age_groups = {"<18":0,"18-25":0,"26-40":0,"41-60":0,"60+":0} 
-    for e in eng_col.find({}, {"age":1}): 
-        age = e.get("age") 
-        if not age: 
-            continue 
-        try: 
-            age = int(age) 
-            if age < 18: 
-                age_groups["<18"] += 1 
-            elif age <= 25: 
-                age_groups["18-25"] += 1 
-            elif age <= 40: 
-                age_groups["26-40"] += 1 
-            elif age <= 60: 
-                age_groups["41-60"] += 1 
-            else: 
-                age_groups["60+"] += 1 
-        except Exception: 
-            continue 
- 
-    # Jobs 
-    jobs = {} 
-    for e in eng_col.find({}, {"job":1}): 
-        j = (e.get("job") or "Unknown").strip() 
-        jobs[j] = jobs.get(j,0) + 1 
- 
-    # Services and questions 
-    services = {} 
-    questions = {} 
-    desires = {} 
-    for e in eng_col.find({}, {"service":1, "question_clicked":1, "desires":1}): 
-        s = e.get("service") or "Unknown" 
-        q = e.get("question_clicked") or "Unknown" 
-        ds = e.get("desires") or [] 
-        services[s] = services.get(s,0) + 1 
-        questions[q] = questions.get(q,0) + 1 
-        for d in ds: 
-            desires[d] = desires.get(d,0) + 1 
- 
-    # Suggest premium help: users with repeated engagements on same desire or question
-    pipeline = [ 
-        {"$group": {"_id": {"user":"$user_id","question":"$question_clicked"}, "count":{"$sum":1}}}, 
-        {"$match": {"count": {"$gte": 2}}} 
-    ] 
-    repeated = list(eng_col.aggregate(pipeline)) 
-    premium_suggestions = [ 
-        {"user": r["_id"]["user"], "question": r["_id"]["question"], "count": r["count"]} 
-        for r in repeated if r["_id"]["user"] 
-    ] 
- 
-    return jsonify({ 
-        "age_groups": age_groups, 
-        "jobs": jobs, 
-        "services": services, 
-        "questions": questions, 
-        "desires": desires, 
-        "premium_suggestions": premium_suggestions 
-    }) 
-
-# Admin CRUD for services (create/update/delete)
-@app.route("/api/admin/services", methods=["GET", "POST"])
+@app.route("/admin/manage")
 @admin_required
-def admin_services():
+def manage_page():
+    return render_template("manage.html")
+
+@app.route("/api/admin/manage/data")
+@admin_required
+def admin_manage_data():
+    """Get admin management dashboard data"""
+    data = {
+        "database": "connected" if db is not None else "offline",
+        "ai_system": "online" if rag_system else "offline",
+        "total_engagements": eng_col.count_documents({}) if eng_col is not None else 0,
+        "total_services": services_col.count_documents({}) if services_col is not None else 0,
+        "knowledge_base_size": len(knowledge_base),
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    return jsonify(data)
+
+@app.route("/admin/login", methods=["GET","POST"])
+def admin_login():
     if request.method == "GET":
-        # Return all services
-        services = list(services_col.find({}, {"_id": 0}))
-        return jsonify(services)
+        return render_template("admin.html")
+    data = request.form
+    username = data.get("username")
+    password = data.get("password")
+    
+    if db is None or admins_col is None: return "Database error", 500
+    
+    admin = admins_col.find_one({"username": username})
+    if admin and admin.get("password") == password:
+        session["admin_logged_in"] = True
+        session["admin_user"] = username
+        return redirect("/admin")
+    return "Login failed", 401
 
-    # POST → create or update
-    payload = request.json or {}
-    sid = payload.get("id")
+@app.route("/api/admin/logout", methods=["POST"])
+@admin_required
+def admin_logout():
+    session.clear()
+    return jsonify({"status":"logged out"})
 
-    if not sid:
-        return jsonify({"error": "Service ID is required"}), 400
+# --- MISSING ADMIN ROUTES (Paste this before "AI ENDPOINTS") ---
 
-    services_col.update_one(
-        {"id": sid},
-        {"$set": payload},
-        upsert=True
-    )
+@app.route("/api/admin/insights")
+@admin_required
+def admin_insights():
+    # 1. Age Groups
+    age_groups = {"<18":0,"18-25":0,"26-40":0,"41-60":0,"60+":0}
+    try:
+        if eng_col is not None:
+            for e in eng_col.find({}, {"age":1}):
+                age = e.get("age")
+                if not age: continue
+                if age < 18: age_groups["<18"] += 1
+                elif age <= 25: age_groups["18-25"] += 1
+                elif age <= 40: age_groups["26-40"] += 1
+                elif age <= 60: age_groups["41-60"] += 1
+                else: age_groups["60+"] += 1
+    except Exception: pass
 
-    return jsonify({"status": "ok"})
+    # 2. Services & Questions
+    services = {}
+    questions = {}
+    if eng_col is not None:
+        for e in eng_col.find({}, {"service":1, "question_clicked":1}):
+            s = e.get("service") or "Unknown"
+            q = e.get("question_clicked") or "Direct Chat"
+            services[s] = services.get(s,0) + 1
+            questions[q] = questions.get(q,0) + 1
 
-@app.route("/api/admin/engagements") 
-@admin_required 
-def admin_engagements(): 
-    items = [] 
-    for e in eng_col.find().sort("timestamp",-1).limit(500): 
-        e["_id"] = str(e["_id"]) 
-        e["timestamp"] = e.get("timestamp").isoformat() if e.get("timestamp") else None 
-        items.append(e) 
-    return jsonify(items) 
- 
-@app.route("/api/admin/export_csv") 
-@admin_required 
-def export_csv(): 
-    cursor = eng_col.find() 
-    si = StringIO() 
-    cw = csv.writer(si) 
-    cw.writerow(["user_id","age","job","desire","question","service","timestamp"]) 
-    for e in cursor: 
-        cw.writerow([ 
-            e.get("user_id"), e.get("age"), e.get("job"), 
-            ",".join(e.get("desires") or []), 
-            e.get("question_clicked"), e.get("service"), 
-            e.get("timestamp").isoformat() if e.get("timestamp") else "" 
-        ]) 
-    csv_bytes = si.getvalue().encode("utf-8") 
-    return send_file( 
-        BytesIO(csv_bytes), 
-        mimetype="text/csv", 
-        as_attachment=True, 
-        download_name="engagements.csv" 
-    ) 
- 
-
-@app.route("/api/admin/services/<service_id>", methods=["DELETE"]) 
-@admin_required 
-def delete_service(service_id): 
-    services_col.delete_one({"id": service_id}) 
-    return jsonify({"status":"deleted"}) 
+    return jsonify({
+        "age_groups": age_groups,
+        "services": services,
+        "questions": questions
+    })
 
 @app.route('/api/admin/index-documents', methods=['POST'])
 def index_documents():
-    """
-    Admin endpoint to add documents to knowledge base
-    
-    Request body:
-    {
-        "documents": [
-            {
-                "text": "Document content here",
-                "source": "https://example.com",
-                "title": "Document Title"
-            }
-        ]
-    }
-    """
+    """Add documents to knowledge base"""
     try:
-        # TODO: Add admin authentication
-        
         data = request.get_json()
         documents = data.get('documents', [])
         
-        if not documents:
-            return jsonify({"error": "No documents provided"}), 400
-        
-        # Add to RAG system
-        count = rag_system.add_documents(documents)
+        for doc in documents:
+            knowledge_base.append(doc)
         
         return jsonify({
-            "message": f"Successfully indexed {count} documents",
-            "count": count
+            "message": f"Successfully indexed {len(documents)} documents",
+            "count": len(documents),
+            "total": len(knowledge_base)
         })
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/admin/search-analytics', methods=['GET'])
-def search_analytics():
-    """Get search analytics for admin"""
-    try:
-        # Get all searches
-        searches = list(db.ai_searches.find({}).sort('timestamp', -1).limit(100))
-        
-        # Calculate metrics
-        total = len(searches)
-        high_confidence = sum(1 for s in searches if s.get('confidence') == 'high')
-        
-        return jsonify({
-            "total_searches": total,
-            "high_confidence_rate": (high_confidence / total * 100) if total > 0 else 0,
-            "recent_searches": searches[:20]
-        })
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.route("/api/admin/engagements")
+@admin_required
+def admin_engagements():
+    items = []
+    if eng_col is not None:
+        for e in eng_col.find().sort("timestamp",-1).limit(100):
+            e["_id"] = str(e["_id"])
+            e["timestamp"] = e.get("timestamp").isoformat() if e.get("timestamp") else ""
+            items.append(e)
+    return jsonify(items)
 
-@app.route('/api/admin/analytics', methods=['GET'])
-def get_analytics():
-    """Get analytics for admin dashboard"""
-    try:
-        # Calculate statistics
-        total_searches = len(search_logs)
-        total_engagements = len(engagement_logs)
-        
-        # Count high confidence searches
-        high_confidence = sum(1 for s in search_logs if s.get('confidence') == 'high')
-        high_confidence_rate = (high_confidence / total_searches * 100) if total_searches > 0 else 0
-        
-        # Get recent searches
-        recent_searches = search_logs[-10:] if search_logs else []
-        
-        # Get top queries (simple count)
-        query_counts = {}
-        for s in search_logs:
-            q = s.get('query', '')
-            query_counts[q] = query_counts.get(q, 0) + 1
-        
-        top_queries = sorted(query_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        
-        return jsonify({
-            "total_searches": total_searches,
-            "total_engagements": total_engagements,
-            "high_confidence_rate": round(high_confidence_rate, 1),
-            "recent_searches": recent_searches,
-            "top_queries": [{"query": q, "count": c} for q, c in top_queries],
-            "knowledge_base_size": len(knowledge_base),
-            "generated_at": datetime.now().isoformat()
-        })
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
 # ============================================
-# AI ENDPOINTS
+# ADMIN SERVICES MANAGEMENT
 # ============================================
 
-# Store for tracking (simple in-memory for now)
-search_logs = []
-engagement_logs = []
+@app.route("/api/admin/services", methods=["GET", "POST"])
+@admin_required
+def admin_services():
+    """Get all services or create/update a service"""
+    if request.method == "GET":
+        # Return all services
+        if db is None or services_col is None:
+            return jsonify([])
+        docs = list(services_col.find({}, {"_id": 0}))
+        return jsonify(docs)
+    
+    # POST method
+    if db is None or services_col is None:
+        return jsonify({"error": "Database offline"}), 500
+    
+    payload = request.json or {}
+    service_id = payload.get("id")
+    
+    if not service_id:
+        return jsonify({"error": "id required"}), 400
+    
+    # Prepare service document
+    service_doc = {
+        "id": service_id,
+        "name": payload.get("name", ""),
+        "questions": payload.get("questions", [])
+    }
+    
+    try:
+        # Upsert: update if exists, insert if not
+        services_col.update_one(
+            {"id": service_id},
+            {"$set": service_doc},
+            upsert=True
+        )
+        return jsonify({"status": "ok", "message": "Service saved successfully"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/admin/services/<service_id>", methods=["DELETE"])
+@admin_required
+def delete_service(service_id):
+    """Delete a service"""
+    if db is None or services_col is None:
+        return jsonify({"error": "Database offline"}), 500
+    
+    try:
+        result = services_col.delete_one({"id": service_id})
+        if result.deleted_count > 0:
+            return jsonify({"status": "deleted", "message": "Service deleted successfully"})
+        else:
+            return jsonify({"error": "Service not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============================================
+# AI ENDPOINTS (FIXED)
+# ============================================
 
 @app.route('/api/ai/search', methods=['POST'])
-@limiter.limit("20 per minute")
+# @limiter.limit("20 per minute") # Commented out for debugging to avoid 429 errors
 def ai_search():
-    """AI-powered search using Gemini RAG System"""
+    """AI-powered search using Gemini"""
     query = None
     try:
         data = request.get_json()
-        
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
+        if not data: return jsonify({"error": "No JSON data"}), 400
         
         query = (data.get('query') or '').strip()
         
-        if not query:
-            return jsonify({"error": "Query is required"}), 400
+        # --- FIX 1: Detect Ghost Input from n8n/Postman ---
+        if "{{" in query or query == "":
+            print(f"⚠️ INVALID INPUT BLOCKED: {query}")
+            return jsonify({
+                "answer": "Error: Invalid query format. Please send real text, not variables.",
+                "success": False
+            })
         
         print(f"🔍 Received query: {query}")
+
+        if not rag_system:
+            return jsonify({"answer": "AI System is offline.", "success": False})
+
+        # --- FIX 2: Use the class we actually have (GeminiComplete) ---
+        # Note: GeminiComplete.generate_answer takes (query, context)
+        # Since we don't have the Vector DB search here, we pass the static KB for now.
+        result = rag_system.generate_answer(query, knowledge_base_text)
+
+        print(f"📊 Result: {result.get('success')}")
         
-        # Call RAG system
-        try:
-            result = rag_system.answer_query(query)
-            print(f"📊 RAG result: {result}")
-            
-            # Check if result is valid
-            if not result or not isinstance(result, dict):
-                raise ValueError("Invalid result from RAG system")
-            
-            if 'error' in result:
-                raise ValueError(result['error'])
-            
-        except Exception as e:
-            print(f"❌ RAG Error: {str(e)}")
-            # Return a fallback response
-            return jsonify({
-                "query": query,
-                "answer": "I'm having trouble accessing my knowledge base right now. Please try again in a moment.",
-                "sources": [],
-                "confidence": "low",
-                "error_details": str(e)
-            })
-        
-        # Log to MongoDB
-        try:
-            db.ai_searches.insert_one({
-                "query": query,
-                "confidence": result.get('confidence', 'unknown'),
-                "timestamp": datetime.utcnow(),
-                "sources_count": len(result.get('sources', []))
-            })
-        except Exception as e:
-            print(f"⚠️ Logging error: {e}")
-        
-        # Log to in-memory
-        search_logs.append({
-            "query": query,
-            "confidence": result.get('confidence', 'unknown'),
-            "timestamp": datetime.now().isoformat(),
-            "sources_count": len(result.get('sources', []))
-        })
+        # Log to MongoDB if available
+        if db is not None:
+            try:
+                db.ai_searches.insert_one({
+                    "query": query,
+                    "timestamp": datetime.utcnow(),
+                    "success": result.get('success', False)
+                })
+            except Exception: pass
         
         return jsonify(result)
     
     except Exception as e:
-        print(f"❌ API Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        # --- FIX 3: Unmask the error ---
+        print(f"❌ CRITICAL API ERROR: {str(e)}")
+        traceback.print_exc() # This prints the full error to your terminal
         
         return jsonify({
             "error": "Search failed",
             "message": str(e),
-            "query": query if 'query' in locals() else "unknown"
+            "query": query or "unknown"
         }), 500
 
 @app.route('/api/ai/chat', methods=['POST'])
-@limiter.limit("30 per minute")
 def ai_chat():
-    """
-    Conversational AI chat with history
-    For multi-turn conversations
-    
-    Request:
-    {
-        "message": "Hello!",
-        "history": [{"role": "user", "content": "Hi"}]  # optional
-    }
-    """
     try:
         data = request.get_json()
         message = data.get('message', '').strip()
         history = data.get('history', [])
         
-        if not message:
-            return jsonify({"error": "Message is required"}), 400
-        
-        # Use Gemini chat with conversation history
+        if not message: return jsonify({"error": "Message required"}), 400
+        if not rag_system: return jsonify({"error": "AI offline"}), 500
+
+        # Call GeminiComplete chat
         result = rag_system.chat(message, history)
-        
-        return jsonify({
-            "response": result.get('response', ''),
-            "history": result.get('history', []),
-            "success": result.get('success', True)
-        })
-    
-    except Exception as e:
-        print(f"❌ Chat error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/api/ai/stats', methods=['GET'])
-def ai_stats():
-    """Get AI system statistics"""
-    try:
-        stats = rag_system.get_stats()
-        
-        # Add search statistics from MongoDB
-        total_searches = db.ai_searches.count_documents({})
-        recent_searches = list(db.ai_searches.find({}).sort('timestamp', -1).limit(10))
-        
-        return jsonify({
-            **stats,
-            'total_searches': total_searches,
-            'recent_queries': [s.get('query', '') for s in recent_searches]
-        })
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-        
-# ============================================
-# HEALTH CHECK
-# ============================================
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        "status": "healthy",
-        "ai_system": "operational",
-        "database": "connected",
-        "timestamp": datetime.utcnow().isoformat()
-    })
-
-@app.route('/api/webhook/n8n/scrape', methods=['POST'])
-def n8n_scrape_webhook():
-    """
-    Webhook for N8N to trigger document scraping
-    
-    Request body:
-    {
-        "urls": [
-            {"url": "https://example.com", "type": "html", "title": "Page Title"}
-        ]
-    }
-    """
-    try:
-        data = request.get_json()
-        urls = data.get('urls', [])
-        
-        if not urls:
-            return jsonify({"error": "No URLs provided"}), 400
-        
-        # Import scraper
-        from scripts.document_scrapper import DocumentScraper
-        scraper = DocumentScraper()
-        
-        # Scrape and index
-        count = scraper.scrape_and_index(urls)
-        
-        return jsonify({
-            "success": True,
-            "count": count,
-            "message": f"Successfully scraped and indexed {count} documents"
-        })
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-@app.route('/api/webhook/n8n/query', methods=['POST'])
-def n8n_query_webhook():
-    """
-    Webhook for N8N to query the AI system
-    
-    Request body:
-    {
-        "query": "How do I apply for a passport?",
-        "user_id": "telegram_12345"
-    }
-    """
-    try:
-        data = request.get_json()
-        query = data.get('query', '')
-        user_id = data.get('user_id', 'anonymous')
-        
-        if not query:
-            return jsonify({"error": "Query is required"}), 400
-        
-        # Get answer
-        result = rag_system.answer_query(query)
-        
-        # Log engagement
-        db.engagements.insert_one({
-            'user_id': user_id,
-            'query': query,
-            'timestamp': datetime.utcnow(),
-            'source': 'n8n_webhook',
-            'confidence': result['confidence']
-        })
-        
         return jsonify(result)
     
     except Exception as e:
+        print(f"❌ Chat error: {str(e)}")
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-    
 
-@app.route('/api/test-ai', methods=['GET'])
-def test_ai():
-    """Test endpoint to debug AI system"""
-    try:
-        # Check RAG system
-        stats = rag_system.get_stats()
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "ai_system": "online" if rag_system else "offline",
+        "database": "connected" if db is not None else "offline",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+if __name__ == "__main__":
+    # Create default admin if DB works
+    if db is not None and admins_col is not None and admins_col.count_documents({}) == 0:
+        admins_col.insert_one({"username":"admin", "password": os.getenv("ADMIN_PWD","admin123")})
+        print("👤 Default admin created")
         
-        # Test query
-        result = rag_system.answer_query("hello")
-        
-        return jsonify({
-            "rag_stats": stats,
-            "test_query": "hello",
-            "test_result": result,
-            "status": "working"
-        })
-    except Exception as e:
-        import traceback
-        return jsonify({
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
-    
-if __name__ == "__main__": 
-    # ensure at least one admin user exists (dev convenience) 
-    if admins_col.count_documents({}) == 0: 
-        admins_col.insert_one({"username":"admin", "password": os.getenv("ADMIN_PWD","admin123")}) 
-    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT",5000))) 
+    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT",5000)))

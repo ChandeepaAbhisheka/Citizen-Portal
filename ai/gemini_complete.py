@@ -181,123 +181,99 @@
 
 
 # ai/gemini_complete.py
+
 import google.generativeai as genai
 import os
-from typing import List, Dict, Optional, Any, cast
+from typing import List, Dict, Optional, Any
+from sentence_transformers import SentenceTransformer
 
 class GeminiComplete:
     """Complete Gemini API implementation with better error handling"""
     
     def __init__(self, api_key: Optional[str] = None):
-        # Get API key
-        api_key = api_key or os.getenv("GEMINI_API_KEY")
+        # 1. Get API key safely
+        api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         
         if not api_key:
-            raise ValueError(
-                "❌ GEMINI_API_KEY not found!\n"
-                "Please add it to your .env file"
-            )
+            raise ValueError("❌ GEMINI_API_KEY not found! Please add it to your .env file")
         
-        # Configure Gemini (SDK may differ across versions)
-        if hasattr(genai, 'configure'):
+        # 2. Configure Gemini API
+        try:
             genai.configure(api_key=api_key)  # type: ignore
-
-        # Initialize model (use cast/ignore to satisfy static checkers)
-        try:
-            self.model = genai.GenerativeModel('gemini-1.5-flash')  # type: ignore
-        except Exception:
-            # Fallback: keep a reference to genai in case the API differs
-            self.model = cast(Any, genai)
-        
-        print("✅ Gemini API initialized successfully!")
-    
-    def generate_answer(self, query: str, context: str) -> Dict:
-        """Generate answer with citations using Gemini"""
-        
-        prompt = f"""You are a helpful assistant for a citizen services portal in Sri Lanka.
-Answer the following question based ONLY on the provided context.
-If the answer cannot be found in the context, say "I don't have enough information to answer that specifically, but I can help you with general guidance."
-Be concise, clear, and helpful.
-
-Context:
-{context}
-
-Question: {query}
-
-Answer:"""
-        
-        try:
-            # Generate content
-            response = self.model.generate_content(  # type: ignore
-                prompt,
-                generation_config=cast(Any, {
-                    'temperature': 0.3,
-                    'top_p': 0.8,
-                    'top_k': 40,
-                    'max_output_tokens': 500,
-                })
-            )
             
-            # IMPORTANT: Check if response has text
-            if not response or not response.text:
-                return {
-                    'answer': "I couldn't generate an answer. Please try rephrasing your question.",
-                    'success': False,
-                    'error': 'Empty response from Gemini'
-                }
-            
-            return {
-                'answer': response.text,
-                'success': True,
-                'model': 'gemini-1.5-flash'
-            }
+            # Use the model found in your check_models.py list
+            self.model = genai.GenerativeModel('gemini-2.5-flash')  # type: ignore
+            print("✅ Gemini API (2.5-Flash) connected!")
             
         except Exception as e:
-            error_msg = str(e)
-            print(f"❌ Gemini error: {error_msg}")
-            
-            # Return more helpful error
-            return {
-                'answer': f"I encountered an error: {error_msg}. Please try again or contact support.",
-                'success': False,
-                'error': error_msg
-            }
+            print(f"❌ Gemini Connection Error: {e}")
+            raise e
+        
+        # 3. Initialize Embedding Model (REQUIRED for Pinecone)
+        print("⏳ Loading embedding model... (this may take a moment)")
+        try:
+            self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+            print("✅ Embeddings model initialized!")
+        except Exception as e:
+            print(f"❌ Embedding Model Failed: {e}")
+            self.embedding_model = None
+
+    # --- RESTORED FUNCTION (Critical for RAG) ---
+    def generate_embeddings(self, text: str) -> List[float]:
+        """Convert text to numbers for Pinecone search"""
+        if not self.embedding_model:
+            raise ValueError("Embedding model is not loaded.")
+        
+        embedding = self.embedding_model.encode(text)
+        return embedding.tolist()
+    # --------------------------------------------
+    
+    def generate_answer(self, query: str, context: str) -> Dict:
+        """Generate answer with a smarter prompt to handle greetings"""
+        
+        # IMPROVED PROMPT: Handles "Hello" without failing
+        prompt = f"""You are a helpful assistant for a citizen services portal in Sri Lanka.
+
+Context information:
+{context}
+
+User Question: {query}
+
+Instructions:
+1. If the user is greeting you (like "hello", "hi"), reply politely and ask how you can help.
+2. If the user asks a specific question, answer it using ONLY the Context information provided above.
+3. If the answer is not in the context, say "I don't have that specific information in my database, but I can help with Passports, IDs, and Tax information."
+"""
+        
+        try:
+            response = self.model.generate_content(prompt)
+            return {'answer': response.text, 'success': True}
+        except Exception as e:
+            print(f"❌ Generation Error: {e}")
+            return {'answer': f"I encountered an error: {str(e)}", 'success': False}
     
     def chat(self, message: str, history: Optional[List[Dict]] = None) -> Dict:
         """Interactive chat with conversation history"""
         try:
-            chat = self.model.start_chat(history=[])  # type: ignore
-
+            # 1. Prepare history for Gemini
+            chat_history = []
             if history:
                 for msg in history:
                     role = 'model' if msg.get('role') == 'assistant' else 'user'
-                    # cast to Any to avoid strict type checks from the SDK wrapper
-                    chat.history.append(cast(Any, {
-                        'role': role,
-                        'parts': [msg.get('content', '')]
-                    }))
+                    chat_history.append({'role': role, 'parts': [msg.get('content', '')]})
 
-            response = chat.send_message(message)  # type: ignore
+            # 2. Start Chat
+            chat = self.model.start_chat(history=chat_history)
+            response = chat.send_message(message)
 
-            # Build a safe history list using getattr to avoid static type errors
-            history_out: List[Dict[str, str]] = []
-            for h in getattr(chat, 'history', []):
-                role = getattr(h, 'role', '')
-                parts = getattr(h, 'parts', []) or []
-                # parts may contain objects or strings depending on SDK
-                content = ''
-                try:
-                    first = parts[0]
-                    # Try multiple ways to extract text
-                    content = getattr(first, 'text', first) or ''
-                except Exception:
-                    content = ''
-
-                history_out.append({'role': role, 'content': content})
+            # 3. Return result with updated history
+            new_history = history or []
+            new_history.append({'role': 'user', 'content': message})
+            new_history.append({'role': 'assistant', 'content': response.text})
 
             return {
-                'response': getattr(response, 'text', str(response)),
-                'history': history_out,
+                'response': response.text,
+                'history': new_history,
                 'success': True
             }
             
@@ -309,8 +285,7 @@ Answer:"""
                 'success': False
             }
 
-
-# Test the module
+# --- TEST BLOCK ---
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
@@ -320,15 +295,28 @@ if __name__ == "__main__":
     try:
         gemini = GeminiComplete()
         
-        # Test with simple context
-        result = gemini.generate_answer(
-            query="What do I need for a passport?",
-            context="To apply for a passport, you need: Birth certificate, National ID, and two photos."
-        )
+        # Test 1: Embeddings
+        print("\n1. Testing Embeddings...")
+        emb = gemini.generate_embeddings("Hello")
+        print(f"✓ Generated {len(emb)} dimensions")
         
-        print(f"\n📝 Test Result:")
-        print(f"Success: {result['success']}")
-        print(f"Answer: {result['answer']}")
+        # Test 2: RAG Answer (The Greeting)
+        print("\n2. Testing Greeting...")
+        result_hello = gemini.generate_answer(
+            query="Hello",
+            context="To apply for a passport, you need: Birth certificate."
+        )
+        print(f"✓ Reply to Hello: {result_hello['answer']}")
+
+        # Test 3: RAG Answer (The Fact)
+        print("\n3. Testing Facts...")
+        result_fact = gemini.generate_answer(
+            query="What do I need for a passport?",
+            context="To apply for a passport, you need: Birth certificate."
+        )
+        print(f"✓ Reply to Fact: {result_fact['answer']}")
         
     except Exception as e:
-        print(f"❌ Test failed: {str(e)}")
+        import traceback
+        print(f"\n❌ Test failed: {str(e)}")
+        traceback.print_exc()
