@@ -411,61 +411,86 @@ search_logs = []
 engagement_logs = []
 
 @app.route('/api/ai/search', methods=['POST'])
+@limiter.limit("20 per minute")
 def ai_search():
-    """AI search endpoint with logging"""
+    """AI-powered search using Gemini RAG System"""
+    query = None
     try:
         data = request.get_json()
         
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
         
-        query = data.get('query', '').strip().lower()
+        query = (data.get('query') or '').strip()
         
         if not query:
             return jsonify({"error": "Query is required"}), 400
         
-        # Simple keyword search
-        results = []
-        for doc in knowledge_base:
-            if any(word in doc['text'].lower() for word in query.split()):
-                results.append(doc)
+        print(f"🔍 Received query: {query}")
         
-        # Generate answer
-        if results:
-            answer = results[0]['text']
-            sources = [{"title": r['title'], "url": r['source']} for r in results]
-            confidence = "high"
-        else:
-            answer = f"I don't have specific information about '{query}'."
-            sources = []
-            confidence = "low"
+        # Call RAG system
+        try:
+            result = rag_system.answer_query(query)
+            print(f"📊 RAG result: {result}")
+            
+            # Check if result is valid
+            if not result or not isinstance(result, dict):
+                raise ValueError("Invalid result from RAG system")
+            
+            if 'error' in result:
+                raise ValueError(result['error'])
+            
+        except Exception as e:
+            print(f"❌ RAG Error: {str(e)}")
+            # Return a fallback response
+            return jsonify({
+                "query": query,
+                "answer": "I'm having trouble accessing my knowledge base right now. Please try again in a moment.",
+                "sources": [],
+                "confidence": "low",
+                "error_details": str(e)
+            })
         
-        # LOG THE SEARCH (for analytics)
+        # Log to MongoDB
+        try:
+            db.ai_searches.insert_one({
+                "query": query,
+                "confidence": result.get('confidence', 'unknown'),
+                "timestamp": datetime.utcnow(),
+                "sources_count": len(result.get('sources', []))
+            })
+        except Exception as e:
+            print(f"⚠️ Logging error: {e}")
+        
+        # Log to in-memory
         search_logs.append({
             "query": query,
-            "confidence": confidence,
+            "confidence": result.get('confidence', 'unknown'),
             "timestamp": datetime.now().isoformat(),
-            "sources_count": len(sources)
+            "sources_count": len(result.get('sources', []))
         })
         
-        return jsonify({
-            "query": query,
-            "answer": answer,
-            "sources": sources,
-            "confidence": confidence
-        })
+        return jsonify(result)
     
     except Exception as e:
-        return jsonify({"error": "Search failed", "message": str(e)}), 500
-
+        print(f"❌ API Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        return jsonify({
+            "error": "Search failed",
+            "message": str(e),
+            "query": query if 'query' in locals() else "unknown"
+        }), 500
 
 @app.route('/api/ai/chat', methods=['POST'])
 @limiter.limit("30 per minute")
 def ai_chat():
     """
-    Interactive chat with Gemini
+    Conversational AI chat with history
+    For multi-turn conversations
     
-    Request body:
+    Request:
     {
         "message": "Hello!",
         "history": [{"role": "user", "content": "Hi"}]  # optional
@@ -479,15 +504,19 @@ def ai_chat():
         if not message:
             return jsonify({"error": "Message is required"}), 400
         
+        # Use Gemini chat with conversation history
         result = rag_system.chat(message, history)
         
         return jsonify({
-            "response": result['response'],
-            "history": result['history']
+            "response": result.get('response', ''),
+            "history": result.get('history', []),
+            "success": result.get('success', True)
         })
     
     except Exception as e:
+        print(f"❌ Chat error: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/api/ai/stats', methods=['GET'])
 def ai_stats():
@@ -495,19 +524,19 @@ def ai_stats():
     try:
         stats = rag_system.get_stats()
         
-        # Add search statistics
+        # Add search statistics from MongoDB
         total_searches = db.ai_searches.count_documents({})
         recent_searches = list(db.ai_searches.find({}).sort('timestamp', -1).limit(10))
         
         return jsonify({
             **stats,
             'total_searches': total_searches,
-            'recent_queries': [s['query'] for s in recent_searches]
+            'recent_queries': [s.get('query', '') for s in recent_searches]
         })
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
+        
 # ============================================
 # HEALTH CHECK
 # ============================================
@@ -595,6 +624,30 @@ def n8n_query_webhook():
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+
+@app.route('/api/test-ai', methods=['GET'])
+def test_ai():
+    """Test endpoint to debug AI system"""
+    try:
+        # Check RAG system
+        stats = rag_system.get_stats()
+        
+        # Test query
+        result = rag_system.answer_query("hello")
+        
+        return jsonify({
+            "rag_stats": stats,
+            "test_query": "hello",
+            "test_result": result,
+            "status": "working"
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
     
 if __name__ == "__main__": 
     # ensure at least one admin user exists (dev convenience) 
